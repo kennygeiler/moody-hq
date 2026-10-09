@@ -1,0 +1,791 @@
+// Hair-clip display for the LilyGO / HiLetgo T-Display (ESP32, 1.14" 240x135).
+//
+// It plays a list of SLIDES one after another. A slide is text, a picture from the phone, or a
+// QR code, and each slide picks its own text effect, pixel animation, font and color.
+//   Right button (GPIO35) tap        -> next slide
+//   Right button hold 2 s            -> edit mode
+//   Left button (GPIO0) hold 2 s     -> turn off (deep sleep). Right button turns it back on.
+// Edit mode: the board makes its own Wi-Fi network (AP_NAME / AP_PASS below). Join it from a
+// phone and a page opens to build the slides and upload pictures. Saving, a right-button tap or
+// 5 minutes without activity turns Wi-Fi back off. Everything survives power-off (flash).
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <LittleFS.h>
+#include <FS.h>
+#include "rm_qrcode.h"          // ricmoo QRCode, copied in: the ESP32 core ships another qrcode.h
+
+TFT_eSPI tft;
+TFT_eSprite spr(&tft);
+WebServer server(80);
+DNSServer dns;
+Preferences prefs;
+
+#include "secrets.h"                     // AP_NAME and AP_PASS: copy secrets.example.h to secrets.h and set your own
+const int BTN_NEXT = 35;                 // right button
+const int BTN_POWER = 0;                 // left button
+const unsigned long HOLD_MS = 2000;
+const unsigned long EDIT_TIMEOUT_MS = 5UL * 60 * 1000;
+const int W = 240, H = 135, MID = 67;
+const int MAX_SLIDES = 10;
+const int MAX_LEN = 120;
+const int NUM_IMG = 4;
+const size_t IMG_BYTES = (size_t)W * H * 2;
+const unsigned long IMAGE_HOLD_MS = 4000;
+const unsigned long QR_HOLD_MS = 8000;
+const unsigned long TYPE_HOLD_MS = 1400;
+
+struct Theme { const char* name; uint8_t bg[3]; uint8_t fg[3]; };
+const Theme THEMES[] = {
+  {"Green",  {160, 235, 70},  {0, 0, 0}},
+  {"Pink",   {255, 130, 200}, {0, 0, 0}},
+  {"Yellow", {255, 225, 40},  {0, 0, 0}},
+  {"Orange", {255, 140, 30},  {0, 0, 0}},
+  {"Blue",   {40, 90, 255},   {255, 255, 255}},
+  {"Night",  {0, 0, 0},       {255, 255, 255}},
+};
+const int NUM_THEMES = sizeof(THEMES) / sizeof(THEMES[0]);
+
+struct FontDef { const char* name; const GFXfont* gfx; uint8_t font; uint8_t size; };
+const FontDef FONTS[] = {
+  {"Chunky",    nullptr, 1, 5},
+  {"Chunky XL", nullptr, 1, 7},
+  {"Small",     nullptr, 1, 3},
+  {"Smooth",    nullptr, 4, 2},
+  {"Bold",      &FreeSansBold24pt7b, 1, 2},
+  {"Serif",     &FreeSerifBoldItalic24pt7b, 1, 2},
+  {"Mono",      &FreeMonoBold24pt7b, 1, 2},
+};
+const int NUM_FONTS = sizeof(FONTS) / sizeof(FONTS[0]);
+
+enum { FX_SCROLL, FX_WAVE, FX_RAINBOW, FX_BOUNCE, FX_TYPE, FX_BLINK, FX_GLITCH, NUM_FX };
+const char* FX_NAMES[] = {"Scroll", "Wave", "Rainbow", "Bounce", "Typewriter", "Blink", "Glitch"};
+enum { AN_NONE, AN_HEARTS, AN_SPARKLE, AN_RAIN, AN_SNOW, AN_FIRE, AN_CHOMP, AN_BALL, AN_CONFETTI, NUM_AN };
+const char* AN_NAMES[] = {"None", "Hearts", "Sparkles", "Rain", "Snow", "Fire", "Chomper", "Bouncing ball", "Confetti"};
+enum { K_TEXT, K_IMAGE, K_QR };
+
+const float SPEED_PX[] = {1.3f, 2.4f, 4.0f};   // scroll pixels per frame
+const char* SPEED_NAMES[] = {"Slow", "Medium", "Fast"};
+const int FRAME_MS = 10;
+
+struct Particle { float x, y, vx, vy; int life; uint16_t col; uint8_t st; bool on; };
+struct Slide { uint8_t kind, fx, anim, font, theme, img; String text; };
+Slide slides[MAX_SLIDES];
+int numSlides = 0;
+int speedIdx = 1;
+
+uint16_t BG, FG;
+int cur = 0;
+float sx = W;                 // scroll position of the text's left edge
+int textW = 0, textH = 0;
+unsigned long slideStart = 0;
+uint16_t* imgBuf = nullptr;   // the current picture, copied into the frame every frame
+bool imgOk = false;
+
+bool editing = false;
+bool exitPending = false;
+unsigned long editActivity = 0;
+unsigned long savedAt = 0;
+fs::File upFile;
+bool upOk = false;
+
+// ---------------------------------------------------------------- battery
+// T-Display v1.1: GPIO14 switches on the battery divider, GPIO34 reads half the battery voltage.
+const int ADC_EN = 14;
+const int ADC_PIN = 34;
+
+float batteryVolts() {
+  uint32_t mv = 0;
+  for (int i = 0; i < 16; i++) mv += analogReadMilliVolts(ADC_PIN);
+  return mv / 16.0f * 2 / 1000.0f;
+}
+
+// ---------------------------------------------------------------- settings
+// The fonts only have plain ASCII. Turn iPhone smart punctuation into ASCII and drop anything
+// else they can't draw (emoji, accents).
+String cleanText(const String& in) {
+  String out;
+  for (int i = 0; i < (int)in.length(); i++) {
+    uint8_t c = in[i];
+    if (c == '\n' || (c >= 32 && c < 127)) {
+      out += (char)c;
+    } else if (c == 0xE2 && i + 2 < (int)in.length() && (uint8_t)in[i + 1] == 0x80) {
+      uint8_t d = in[i + 2];
+      if (d == 0x98 || d == 0x99) out += '\'';
+      else if (d == 0x9C || d == 0x9D) out += '"';
+      else if (d == 0x93 || d == 0x94) out += '-';
+      else if (d == 0xA6) out += "...";
+      i += 2;
+    }
+  }
+  return out;
+}
+
+String imgPath(int n) { return "/img" + String(n) + ".bin"; }
+bool imgExists(int n) {
+  fs::File f = LittleFS.open(imgPath(n), "r");
+  bool ok = f && f.size() == IMG_BYTES;
+  if (f) f.close();
+  return ok;
+}
+
+// One slide per line: kind|effect|animation|font|color|picture|text  (text is last, so it may hold a |)
+void parseSlides(const String& all) {
+  numSlides = 0;
+  int start = 0;
+  while (start < (int)all.length() && numSlides < MAX_SLIDES) {
+    int nl = all.indexOf('\n', start);
+    if (nl < 0) nl = all.length();
+    String line = all.substring(start, nl);
+    start = nl + 1;
+    int v[6], p = 0;
+    bool ok = true;
+    for (int i = 0; i < 6; i++) {
+      int bar = line.indexOf('|', p);
+      if (bar < 0) { ok = false; break; }
+      v[i] = line.substring(p, bar).toInt();
+      p = bar + 1;
+    }
+    if (!ok) continue;
+    Slide& s = slides[numSlides];
+    s.kind = constrain(v[0], 0, 2);
+    s.fx = constrain(v[1], 0, NUM_FX - 1);
+    s.anim = constrain(v[2], 0, NUM_AN - 1);
+    s.font = constrain(v[3], 0, NUM_FONTS - 1);
+    s.theme = constrain(v[4], 0, NUM_THEMES - 1);
+    s.img = constrain(v[5], 0, NUM_IMG - 1);
+    s.text = line.substring(p);
+    s.text.trim();
+    s.text = s.text.substring(0, MAX_LEN);
+    if (s.kind == K_TEXT && !s.text.length()) continue;
+    if (s.kind == K_QR && !s.text.length()) continue;
+    numSlides++;
+  }
+  if (numSlides == 0) {
+    slides[0] = {K_TEXT, FX_SCROLL, AN_NONE, 0, 0, 0, "hi :)"};
+    numSlides = 1;
+  }
+}
+
+String joinedSlides() {
+  String all;
+  for (int i = 0; i < numSlides; i++) {
+    const Slide& s = slides[i];
+    if (i) all += '\n';
+    all += String(s.kind) + "|" + s.fx + "|" + s.anim + "|" + s.font + "|" + s.theme + "|" + s.img + "|" + s.text;
+  }
+  return all;
+}
+
+void loadSettings() {
+  prefs.begin("hair", false);
+  String all = prefs.getString("slides", "");
+  speedIdx = prefs.getInt("speed", 1);
+  if (!all.length()) {                    // first run after the text-only version: keep its messages
+    String old = prefs.getString("msgs", "hi :)");
+    int th = constrain(prefs.getInt("theme", 0), 0, NUM_THEMES - 1);
+    int start = 0;
+    while (start < (int)old.length()) {
+      int nl = old.indexOf('\n', start);
+      if (nl < 0) nl = old.length();
+      String line = old.substring(start, nl);
+      line.trim();
+      if (line.length()) all += (all.length() ? "\n" : "") + String("0|0|0|0|") + th + "|0|" + line;
+      start = nl + 1;
+    }
+  }
+  prefs.end();
+  if (speedIdx < 0 || speedIdx > 2) speedIdx = 1;
+  parseSlides(all);
+}
+
+void saveSettings() {
+  prefs.begin("hair", false);
+  prefs.putString("slides", joinedSlides());
+  prefs.putInt("speed", speedIdx);
+  prefs.end();
+}
+
+// ---------------------------------------------------------------- drawing helpers
+uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) { return tft.color565(r, g, b); }
+
+uint16_t hue(int h) {                     // bright rainbow color, h in degrees
+  h = ((h % 360) + 360) % 360;
+  int x = 255 - abs((h % 120) * 255 / 60 - 255);
+  switch (h / 60) {
+    case 0: return rgb(255, x, 0);
+    case 1: return rgb(x, 255, 0);
+    case 2: return rgb(0, 255, x);
+    case 3: return rgb(0, x, 255);
+    case 4: return rgb(x, 0, 255);
+    default: return rgb(255, 0, x);
+  }
+}
+
+void useFont(int f) {
+  const FontDef& d = FONTS[f];
+  if (d.gfx) spr.setFreeFont(d.gfx); else spr.setTextFont(d.font);
+  spr.setTextSize(d.size);
+  spr.setTextDatum(ML_DATUM);
+}
+
+// Draw a line of text with its effect. x = left edge, y = vertical middle.
+void drawFx(const String& t, int x, int y, int fx, uint16_t col, unsigned long now) {
+  if (fx == FX_BLINK && (now / 380) % 2) return;
+  if (fx == FX_BOUNCE) y -= (int)(fabs(sin(now / 190.0)) * 20) - 8;
+  if (fx == FX_GLITCH && random(100) < 12) {
+    int j = random(-7, 8);
+    spr.setTextColor(rgb(0, 255, 255)); spr.drawString(t, x - 5 + j, y + random(-3, 4));
+    spr.setTextColor(rgb(255, 0, 200)); spr.drawString(t, x + 5 + j, y + random(-3, 4));
+    x += j;
+  }
+  if (fx == FX_WAVE || fx == FX_RAINBOW) {
+    int cx = x;
+    for (int i = 0; i < (int)t.length(); i++) {
+      String ch = String(t[i]);
+      int cw = spr.textWidth(ch);
+      if (cx + cw > 0 && cx < W) {
+        int cy = fx == FX_WAVE ? y + (int)(sin(now / 150.0 + i * 0.7) * 13) : y;
+        spr.setTextColor(fx == FX_RAINBOW ? hue(now / 6 + i * 28) : col);
+        spr.drawString(ch, cx, cy);
+      }
+      cx += cw;
+    }
+    return;
+  }
+  spr.setTextColor(col);
+  spr.drawString(t, x, y);
+}
+
+// ---------------------------------------------------------------- pixel animations
+// They know where the text is (left edge, width, top, bottom) so they can land on it, rise from
+// it, chase it or eat it.
+const int NUM_P = 30;
+Particle ps[NUM_P];
+float ballX = 20, ballY = 20, ballVy = 0;
+
+void clearAnim() {
+  for (int i = 0; i < NUM_P; i++) ps[i].on = false;
+  ballX = 20; ballY = 20; ballVy = 0;
+}
+
+Particle* spawn() {
+  for (int i = 0; i < NUM_P; i++) if (!ps[i].on) { ps[i] = {0, 0, 0, 0, 0, 0, 0, true}; return &ps[i]; }
+  return nullptr;
+}
+
+void heart(int x, int y, uint16_t c) {
+  spr.fillCircle(x - 3, y, 3, c); spr.fillCircle(x + 3, y, 3, c);
+  spr.fillTriangle(x - 6, y + 1, x + 6, y + 1, x, y + 8, c);
+}
+
+void drawAnim(int an, int tx, int tw, int top, int bot, float dx, unsigned long now, bool overPicture) {
+  if (an == AN_NONE) return;
+  bool hasText = tw > 0;
+  int l = hasText ? max(tx, 0) : 0, r = hasText ? min(tx + tw, W) : W;   // the part of the text on screen
+  bool span = r > l;
+  auto over = [&](float x) { return hasText && span && x >= l && x <= r; };
+
+  if (an == AN_FIRE) {                     // flames along the bottom, taller under the letters
+    for (int x = 0; x < W; x += 7) {
+      int h = 10 + random(14) + (over(x) ? 16 : 0);
+      spr.fillTriangle(x - 5, H, x + 5, H, x + random(-2, 3), H - h, rgb(255, 110, 20));
+      spr.fillTriangle(x - 3, H, x + 3, H, x, H - h / 2, rgb(255, 225, 60));
+    }
+    return;
+  }
+  if (an == AN_CHOMP) {                    // sits at the left and eats the letters as they arrive
+    int cx = 30, rad = 26, m = (int)(fabs(sin(now / 110.0)) * 20);
+    uint16_t body = (!overPicture && BG == rgb(255, 225, 40)) ? rgb(0, 0, 0) : rgb(255, 225, 40);
+    if (!overPicture) spr.fillRect(0, 0, cx, H, BG);
+    spr.fillCircle(cx, MID, rad, body);
+    spr.fillTriangle(cx, MID, cx + rad + 2, MID - m, cx + rad + 2, MID + m, overPicture ? rgb(0, 0, 0) : BG);
+    spr.fillCircle(cx + 2, MID - 14, 3, overPicture ? rgb(0, 0, 0) : BG);
+    return;
+  }
+  if (an == AN_BALL) {                     // bounces along the tops of the letters
+    int rad = 7;
+    ballX += 1.6f; if (ballX > W + rad) ballX = -rad;
+    ballVy += 0.55f; ballY += ballVy;
+    float floorY = (over(ballX) ? top : H) - rad;
+    if (ballY > floorY) { ballY = floorY; ballVy = over(ballX) ? -6.5f : -9.5f; }
+    spr.fillCircle((int)ballX, (int)ballY, rad, rgb(255, 60, 60));
+    spr.fillCircle((int)ballX - 2, (int)ballY - 2, 2, rgb(255, 255, 255));
+    return;
+  }
+
+  // particle kinds
+  if (an == AN_HEARTS && random(100) < 14) {
+    if (Particle* p = spawn()) { p->x = span ? random(l, r + 1) : random(W); p->y = hasText ? top + 6 : H; p->vy = -1.3f; p->vx = random(-10, 11) / 25.0f; p->life = 70; p->col = random(2) ? rgb(255, 40, 90) : rgb(255, 255, 255); }
+  }
+  if (an == AN_SPARKLE && random(100) < 30) {
+    if (Particle* p = spawn()) {
+      if (span) { p->x = random(l - 10, r + 11); p->y = random(2) ? top - random(2, 16) : bot + random(2, 16); }
+      else { p->x = random(W); p->y = random(H); }
+      p->life = 14; p->col = random(3) ? rgb(255, 255, 255) : rgb(255, 235, 90);
+    }
+  }
+  if (an == AN_RAIN && random(100) < 45) {
+    if (Particle* p = spawn()) { p->x = random(W); p->y = -6; p->vy = 5.5f; p->life = 200; p->col = BG == rgb(40, 90, 255) || overPicture ? rgb(255, 255, 255) : rgb(40, 110, 255); }
+  }
+  if (an == AN_SNOW && random(100) < 22) {
+    if (Particle* p = spawn()) { p->x = random(W); p->y = -4; p->vy = 1.1f; p->life = 400; p->col = BG == rgb(255, 255, 255) ? rgb(120, 160, 255) : rgb(255, 255, 255); }
+  }
+  if (an == AN_CONFETTI && random(100) < 35) {
+    if (Particle* p = spawn()) { p->x = random(W); p->y = -4; p->vy = 2.2f + random(10) / 8.0f; p->vx = random(-10, 11) / 20.0f; p->life = 300; p->col = hue(random(360)); }
+  }
+
+  for (int i = 0; i < NUM_P; i++) {
+    Particle& p = ps[i];
+    if (!p.on) continue;
+    p.x += p.vx; p.y += p.vy;
+    if (--p.life <= 0 || p.y > H + 8 || p.y < -12 || p.x < -12 || p.x > W + 12) { p.on = false; continue; }
+    switch (an) {
+      case AN_HEARTS:
+        p.x += sin((now + i * 90) / 160.0) * 0.6f;
+        heart((int)p.x, (int)p.y, p.col);
+        break;
+      case AN_SPARKLE: {
+        int s = p.life > 7 ? 14 - p.life : p.life;       // grows then shrinks
+        spr.drawFastHLine((int)p.x - s, (int)p.y, 2 * s + 1, p.col);
+        spr.drawFastVLine((int)p.x, (int)p.y - s, 2 * s + 1, p.col);
+        break;
+      }
+      case AN_RAIN:
+        if (p.st == 0 && over(p.x) && p.y >= top) {       // hits a letter: splash
+          p.st = 1; p.y = top; p.vy = -2.2f; p.vx = random(2) ? 1.6f : -1.6f; p.life = 7;
+        }
+        if (p.st == 0) spr.drawFastVLine((int)p.x, (int)p.y, 7, p.col);
+        else { p.vy += 0.5f; spr.fillRect((int)p.x, (int)p.y, 2, 2, p.col); }
+        break;
+      case AN_SNOW:
+        if (p.st == 0 && over(p.x) && p.y >= top - 2) { p.st = 1; p.y = top - 2; p.vy = 0; p.vx = -dx; p.life = 55; }   // settles and rides the text
+        if (p.st == 0) p.x += sin((now + i * 130) / 300.0) * 0.5f;
+        spr.fillCircle((int)p.x, (int)p.y, 2, p.col);
+        break;
+      case AN_CONFETTI:
+        if (p.st == 0 && over(p.x) && p.y >= top) { p.st = 1; p.vy = -p.vy * 0.55f; }   // one bounce off the letters
+        if (p.st == 1) p.vy += 0.25f;
+        spr.fillRect((int)p.x, (int)p.y, 4, 4, p.col);
+        break;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- slides
+void drawQr(const String& t) {
+  static const int CAP[] = {17, 32, 53, 78, 106, 134, 154, 192, 230, 271};   // bytes at low error correction, versions 1-10
+  int ver = 0;
+  for (int v = 1; v <= 10; v++) if ((int)t.length() <= CAP[v - 1]) { ver = v; break; }
+  spr.fillSprite(TFT_WHITE);
+  if (!ver) {
+    spr.setTextFont(2); spr.setTextSize(1); spr.setTextDatum(MC_DATUM); spr.setTextColor(TFT_BLACK);
+    spr.drawString("QR text is too long", W / 2, MID);
+    return;
+  }
+  QRCode qr;
+  uint8_t* data = (uint8_t*)malloc(qrcode_getBufferSize(ver));
+  if (!data) return;
+  qrcode_initText(&qr, data, ver, ECC_LOW, t.c_str());
+  int px = (H - 8) / qr.size;
+  int ox = (W - px * qr.size) / 2, oy = (H - px * qr.size) / 2;
+  for (int y = 0; y < qr.size; y++)
+    for (int x = 0; x < qr.size; x++)
+      if (qrcode_getModule(&qr, x, y)) spr.fillRect(ox + x * px, oy + y * px, px, px, TFT_BLACK);
+  free(data);
+}
+
+void loadSlide() {
+  Slide& s = slides[cur];
+  const Theme& t = THEMES[s.theme];
+  BG = rgb(t.bg[0], t.bg[1], t.bg[2]);
+  FG = rgb(t.fg[0], t.fg[1], t.fg[2]);
+  useFont(s.font);
+  textW = s.text.length() ? spr.textWidth(s.text) : 0;
+  textH = spr.fontHeight();
+  sx = W;
+  slideStart = millis();
+  clearAnim();
+  imgOk = false;
+  if (s.kind == K_IMAGE && imgBuf) {
+    fs::File f = LittleFS.open(imgPath(s.img), "r");
+    if (f && f.size() == IMG_BYTES) imgOk = f.read((uint8_t*)imgBuf, IMG_BYTES) == (int)IMG_BYTES;
+    if (f) f.close();
+  }
+}
+
+void nextSlide() {
+  cur = (cur + 1) % numSlides;
+  loadSlide();
+}
+
+void drawFrame() {
+  Slide& s = slides[cur];
+  unsigned long now = millis(), age = now - slideStart;
+  float dx = SPEED_PX[speedIdx];
+
+  if (s.kind == K_QR) {
+    drawQr(s.text);
+    spr.pushSprite(0, 0);
+    if (age > QR_HOLD_MS) nextSlide();
+    return;
+  }
+
+  bool pic = s.kind == K_IMAGE;
+  if (pic && imgOk) memcpy(spr.getPointer(), imgBuf, IMG_BYTES);
+  else if (pic) {
+    spr.fillSprite(TFT_BLACK);
+    spr.setTextFont(2); spr.setTextSize(1); spr.setTextDatum(MC_DATUM); spr.setTextColor(TFT_WHITE);
+    spr.drawString("No picture " + String(s.img + 1) + " yet", W / 2, MID);
+  } else spr.fillSprite(BG);
+
+  useFont(s.font);
+  int top = MID - textH / 2 + 4, bot = MID + textH / 2 - 4;
+  int tx = (int)sx, shownW = textW;
+  bool done = false;
+
+  if (textW > 0) {
+    uint16_t col = pic ? rgb(255, 255, 255) : FG;
+    if (s.fx == FX_TYPE) {                 // types itself out; a long line slides left as it grows
+      int n = min((int)s.text.length(), (int)(age / 110) + 1);
+      String part = s.text.substring(0, n);
+      shownW = spr.textWidth(part);
+      tx = shownW > W - 16 ? W - 8 - shownW : 8;
+      if (pic) drawFx(part, tx + 3, MID + 3, FX_SCROLL, rgb(0, 0, 0), now);
+      drawFx(part, tx, MID, FX_SCROLL, col, now);
+      if ((now / 300) % 2) spr.fillRect(tx + shownW + 3, top, 6, bot - top, col);
+      done = age > s.text.length() * 110UL + TYPE_HOLD_MS;
+    } else {
+      if (pic) drawFx(s.text, tx + 3, MID + 3, s.fx == FX_BLINK ? FX_BLINK : FX_SCROLL, rgb(0, 0, 0), now);   // shadow so it reads on a photo
+      drawFx(s.text, tx, MID, s.fx, col, now);
+      sx -= dx;
+      done = sx < -textW && (!pic || age > IMAGE_HOLD_MS);
+      if (pic && sx < -textW) sx = W;      // keep looping the caption while the picture is held
+    }
+  } else done = age > IMAGE_HOLD_MS;
+
+  drawAnim(s.anim, tx, shownW, top, bot, s.fx == FX_TYPE ? 0 : dx, now, pic);
+  spr.pushSprite(0, 0);
+  if (done) nextSlide();
+}
+
+// ---------------------------------------------------------------- edit mode (Wi-Fi)
+String jsEsc(const String& s) {
+  String o;
+  for (char c : s) {
+    if (c == '\\' || c == '"') { o += '\\'; o += c; }
+    else if (c == '<') o += "\\u003c";
+    else o += c;
+  }
+  return o;
+}
+
+String jsList(const char* const* names, int n) {
+  String o = "[";
+  for (int i = 0; i < n; i++) { if (i) o += ","; o += "\""; o += names[i]; o += "\""; }
+  return o + "]";
+}
+
+const char PAGE[] PROGMEM = R"html(<!doctype html><html><head>
+<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Hair display</title><style>
+body{font-family:-apple-system,system-ui,sans-serif;margin:0;padding:18px;background:#111;color:#eee}
+h1{font-size:24px;margin:0 0 6px}p{color:#aaa;margin:0;font-size:14px;line-height:1.4}
+.h{font-weight:700;font-size:18px;margin:26px 0 8px}
+.card{background:#1c1c1e;border:1px solid #333;border-radius:14px;padding:12px;margin-bottom:12px}
+.row{display:flex;align-items:center;gap:8px;margin-bottom:10px}.sp{flex:1}
+.num{background:#a0eb46;color:#000;font-weight:800;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center}
+.seg{display:flex;border:1px solid #555;border-radius:10px;overflow:hidden}
+.seg a{padding:7px 11px;font-weight:700;font-size:14px;color:#ccc}.seg a.on{background:#eee;color:#000}
+.ic{padding:6px 10px;border-radius:9px;background:#333;font-weight:700}
+input[type=text],select{width:100%;box-sizing:border-box;font-size:16px;padding:10px;border-radius:10px;border:1px solid #444;background:#222;color:#fff}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.g label,.l{font-size:12px;color:#999;display:block;margin-bottom:3px}
+.add{display:flex;gap:8px}.add a{flex:1;text-align:center;padding:12px 6px;border-radius:12px;background:#2a2a2c;border:1px dashed #666;font-weight:700}
+.im{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.im .card{margin:0;text-align:center}.im canvas{width:100%;border-radius:8px;background:#000;display:block;margin-bottom:8px;touch-action:none}input[type=range]{width:100%}
+.pick{display:block;padding:9px;border-radius:10px;background:#333;font-weight:700;font-size:14px}.pick input{display:none}
+.st{font-size:12px;color:#999;margin-top:5px;min-height:15px}
+.opts{display:flex;gap:8px}.opts input{display:none}
+.opts span{display:inline-block;padding:11px 15px;border-radius:12px;border:3px solid transparent;font-weight:700;background:#333}
+.opts input:checked+span{border-color:#fff}
+button{margin-top:26px;width:100%;padding:17px;font-size:19px;font-weight:800;border:0;border-radius:14px;background:#a0eb46;color:#000}
+</style></head><body><h1>Hair display</h1>
+<p>Build your loop. It plays the slides top to bottom, then starts again.</p>
+<div class=h>Mix and match</div>
+<p style="margin-bottom:10px">Each slide is text, a picture or a QR code, with its own effect, animation, font and color.</p>
+<div id=sl></div>
+<div class=add><a onclick="add(0)">+ Text</a><a onclick="add(1)">+ Picture</a><a onclick="add(2)">+ QR code</a></div>
+<div class=h>Pictures from your phone</div>
+<p style="margin-bottom:10px">Pick a photo. The box shows exactly what the screen will show: drag to move it, slide to zoom, then save.</p>
+<div class=im id=im></div>
+<div class=h>Scroll speed</div><div class=opts id=sp></div>
+<form method=post action=/save onsubmit="return go()"><input type=hidden name=d id=d><input type=hidden name=s id=s>
+<button>Save and play</button></form>
+<p style="margin-top:18px">Battery: __BATT__ V (full 4.2, low 3.4). Letters, numbers and punctuation only (no emoji).</p>
+<script>
+var S=__S__,IM=__IM__,SPD=__SPD__,FX=__FX__,AN=__AN__,FO=__FO__,TH=__TH__,SPN=["Slow","Medium","Fast"],KN=["Text","Picture","QR code"];
+function opt(l,v){return l.map(function(n,i){return'<option value='+i+(i==v?' selected':'')+'>'+n+'</option>'}).join('')}
+function sel(i,k,l,name){return'<div><label>'+name+'</label><select onchange="S['+i+'].'+k+'=+this.value">'+opt(l,S[i][k])+'</select></div>'}
+function q(t){return String(t).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')}
+function draw(){var h='';S.forEach(function(s,i){
+h+='<div class=card><div class=row><span class=num>'+(i+1)+'</span><span class=seg>'+KN.map(function(n,k){return'<a class="'+(s.k==k?'on':'')+'" onclick="S['+i+'].k='+k+';draw()">'+n+'</a>'}).join('')+'</span><span class=sp></span>'+
+'<a class=ic onclick="mv('+i+',-1)">&#9650;</a><a class=ic onclick="mv('+i+',1)">&#9660;</a><a class=ic onclick="S.splice('+i+',1);draw()">&#10005;</a></div>';
+if(s.k==1)h+='<span class=l>Which picture</span><select onchange="S['+i+'].n=+this.value">'+opt(["Picture 1","Picture 2","Picture 3","Picture 4"],s.n)+'</select><span class=l style="margin-top:10px">Caption over it (optional)</span>';
+if(s.k==2)h+='<span class=l>Link or text for the QR code</span>';
+h+='<input type=text maxlength=120 autocapitalize=off autocorrect=off spellcheck=false placeholder="'+(s.k==2?'https://...':s.k==1?'caption':'your text')+'" value="'+q(s.t)+'" oninput="S['+i+'].t=this.value">';
+if(s.k!=2)h+='<div class=g>'+sel(i,'e',FX,'Text effect')+sel(i,'a',AN,'Pixel animation')+sel(i,'f',FO,'Font')+(s.k==0?sel(i,'c',TH,'Color'):'')+'</div>';
+h+='</div>'});
+document.getElementById('sl').innerHTML=h||'<p style="margin-bottom:12px">No slides yet. Add one below.</p>'}
+function add(k){if(S.length>=10){alert('10 slides is the most it holds.');return}var p=S[S.length-1]||{e:0,a:0,f:0,c:0};S.push({k:k,e:p.e,a:k==0?p.a:0,f:p.f,c:p.c,n:0,t:''});draw()}
+function mv(i,d){var j=i+d;if(j<0||j>=S.length)return;var t=S[i];S[i]=S[j];S[j]=t;draw()}
+function go(){var bad=S.filter(function(s){return s.k!=1&&!String(s.t).trim()}).length;if(bad&&!confirm(bad+' empty slide(s) will be left out. Save anyway?'))return false;
+document.getElementById('d').value=S.map(function(s){return[s.k,s.e,s.a,s.f,s.c,s.n,String(s.t).replace(/[\r\n]/g,' ')].join('|')}).join('\n');
+document.getElementById('s').value=SPD;return true}
+function ims(){var h='';for(var n=0;n<4;n++)h+='<div class=card><canvas id=cv'+n+' width=240 height=135></canvas><div id=ct'+n+' style="display:none"><span class=l>Zoom</span><input type=range min=100 max=400 value=100 oninput="C['+n+'].z=this.value/100;rd('+n+')"><a class=pick style="background:#a0eb46;color:#000;margin:8px 0" onclick="sv('+n+')">Save this crop</a></div><label class=pick>Choose picture '+(n+1)+'<input type=file accept="image/*" onchange="up('+n+',this)"></label><div class=st id=st'+n+'>'+(IM[n]?'Saved':'Empty')+'</div></div>';
+document.getElementById('im').innerHTML=h;for(n=0;n<4;n++){if(IM[n])show(n);drag(n)}}
+function show(n){fetch('/img?n='+n).then(function(r){return r.arrayBuffer()}).then(function(b){var a=new Uint8Array(b);if(a.length!=64800)return;var x=document.getElementById('cv'+n).getContext('2d'),im=x.createImageData(240,135),d=im.data;
+for(var i=0,j=0;i<a.length;i+=2,j+=4){var v=(a[i]<<8)|a[i+1];d[j]=(v>>8)&248;d[j+1]=(v>>3)&252;d[j+2]=(v<<3)&248;d[j+3]=255}x.putImageData(im,0,0)}).catch(function(){})}
+var C={};
+function up(n,inp){var f=inp.files[0];if(!f)return;var st=document.getElementById('st'+n);st.textContent='Loading...';var img=new Image();
+img.onload=function(){C[n]={img:img,z:1,x:.5,y:.5};document.getElementById('ct'+n).style.display='block';document.querySelector('#ct'+n+' input').value=100;rd(n);st.textContent='Drag the picture to move it, slide to zoom, then Save this crop.'};
+img.onerror=function(){st.textContent='Could not read that picture'};img.src=URL.createObjectURL(f)}
+function rd(n){var c=C[n];if(!c)return;var x=document.getElementById('cv'+n).getContext('2d'),r=Math.max(240/c.img.width,135/c.img.height)*c.z;c.w=c.img.width*r;c.h=c.img.height*r;
+c.x=Math.min(1,Math.max(0,c.x));c.y=Math.min(1,Math.max(0,c.y));x.fillStyle='#000';x.fillRect(0,0,240,135);x.drawImage(c.img,-(c.w-240)*c.x,-(c.h-135)*c.y,c.w,c.h)}
+function drag(n){var cv=document.getElementById('cv'+n),lx=0,ly=0,on=false;
+function pt(e){var t=e.touches?e.touches[0]:e;return[t.clientX,t.clientY]}
+function dn(e){if(!C[n])return;on=true;var p=pt(e);lx=p[0];ly=p[1];e.preventDefault()}
+function mvv(e){if(!on||!C[n])return;var p=pt(e),k=240/cv.clientWidth,c=C[n];if(c.w>240.5)c.x-=(p[0]-lx)*k/(c.w-240);if(c.h>135.5)c.y-=(p[1]-ly)*k/(c.h-135);lx=p[0];ly=p[1];rd(n);e.preventDefault()}
+function upp(){on=false}
+cv.addEventListener('touchstart',dn,{passive:false});cv.addEventListener('touchmove',mvv,{passive:false});cv.addEventListener('touchend',upp);
+cv.addEventListener('mousedown',dn);window.addEventListener('mousemove',mvv);window.addEventListener('mouseup',upp)}
+function sv(n){if(!C[n])return;var st=document.getElementById('st'+n),d=document.getElementById('cv'+n).getContext('2d').getImageData(0,0,240,135).data,o=new Uint8Array(64800);
+for(var i=0,j=0;i<d.length;i+=4){var v=((d[i]&248)<<8)|((d[i+1]&252)<<3)|(d[i+2]>>3);o[j++]=v>>8;o[j++]=v&255}
+var fd=new FormData();fd.append('f',new Blob([o]),'i.bin');st.textContent='Sending...';
+fetch('/img?n='+n,{method:'POST',body:fd}).then(function(r){st.textContent=r.ok?'Saved. Drag or zoom and save again to change it.':'Did not save - try again';if(r.ok)IM[n]=1}).catch(function(){st.textContent='Did not save - try again'})}
+document.getElementById('sp').innerHTML=SPN.map(function(n,i){return'<label><input type=radio name=q'+(i==SPD?' checked':'')+' onchange="SPD='+i+'"><span>'+n+'</span></label>'}).join('');
+draw();ims();
+</script></body></html>)html";
+
+// The page is sent in pieces straight from flash, with the live values dropped into the __NAME__ slots.
+// (Building it as one big String ran out of memory once Wi-Fi was on, and the phone got a blank page.)
+void handleRoot() {
+  editActivity = millis();
+  String s = "[";
+  for (int i = 0; i < numSlides; i++) {
+    const Slide& d = slides[i];
+    if (i) s += ",";
+    s += "{k:" + String(d.kind) + ",e:" + d.fx + ",a:" + d.anim + ",f:" + d.font + ",c:" + d.theme + ",n:" + d.img + ",t:\"" + jsEsc(d.text) + "\"}";
+  }
+  s += "]";
+  String im = "[";
+  for (int i = 0; i < NUM_IMG; i++) { if (i) im += ","; im += imgExists(i) ? "1" : "0"; }
+  im += "]";
+  const char* fo[NUM_FONTS]; for (int i = 0; i < NUM_FONTS; i++) fo[i] = FONTS[i].name;
+  const char* th[NUM_THEMES]; for (int i = 0; i < NUM_THEMES; i++) th[i] = THEMES[i].name;
+  const char* keys[] = {"__S__", "__IM__", "__SPD__", "__FX__", "__AN__", "__FO__", "__TH__", "__BATT__"};
+  String vals[] = {s, im, String(speedIdx), jsList(FX_NAMES, NUM_FX), jsList(AN_NAMES, NUM_AN), jsList(fo, NUM_FONTS), jsList(th, NUM_THEMES), String(batteryVolts(), 2)};
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  const char* p = PAGE;
+  while (*p) {
+    const char* next = strstr(p, "__");
+    int which = -1;
+    if (next) for (int k = 0; k < 8; k++) if (strncmp(next, keys[k], strlen(keys[k])) == 0) { which = k; break; }
+    if (!next) { server.sendContent_P(p, strlen(p)); break; }
+    if (which < 0) { server.sendContent_P(p, next - p + 2); p = next + 2; continue; }   // a "__" that is not a slot
+    if (next > p) server.sendContent_P(p, next - p);
+    server.sendContent(vals[which]);
+    p = next + strlen(keys[which]);
+  }
+  server.sendContent("");
+}
+
+void handleSave() {
+  parseSlides(cleanText(server.arg("d")));
+  speedIdx = constrain(server.arg("s").toInt(), 0, 2);
+  saveSettings();
+  Serial.printf("saved %d slide(s), speed %s\n", numSlides, SPEED_NAMES[speedIdx]);
+  server.send(200, "text/html",
+              "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+              "<body style=\"font-family:-apple-system,sans-serif;background:#111;color:#eee;padding:24px\">"
+              "<h1>Saved!</h1><p>It's playing your slides. Wi-Fi is turning off, so you can close this.</p>");
+  savedAt = millis();
+  exitPending = true;
+}
+
+void handleImgGet() {
+  editActivity = millis();
+  int n = constrain(server.arg("n").toInt(), 0, NUM_IMG - 1);
+  fs::File f = LittleFS.open(imgPath(n), "r");
+  if (!f || f.size() != IMG_BYTES) { if (f) f.close(); server.send(404, "text/plain", "none"); return; }
+  server.streamFile(f, "application/octet-stream");
+  f.close();
+}
+
+void handleImgUpload() {                  // the phone sends a ready-made 240x135 picture (RGB565, high byte first)
+  HTTPUpload& up = server.upload();
+  int n = constrain(server.arg("n").toInt(), 0, NUM_IMG - 1);
+  editActivity = millis();
+  if (up.status == UPLOAD_FILE_START) {
+    upFile = LittleFS.open(imgPath(n) + ".tmp", "w");
+    upOk = (bool)upFile;
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (upOk && upFile.write(up.buf, up.currentSize) != up.currentSize) upOk = false;
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (upFile) upFile.close();
+    if (upOk && up.totalSize == IMG_BYTES) {
+      LittleFS.remove(imgPath(n));
+      upOk = LittleFS.rename(imgPath(n) + ".tmp", imgPath(n));
+    } else { upOk = false; LittleFS.remove(imgPath(n) + ".tmp"); }
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    if (upFile) upFile.close();
+    LittleFS.remove(imgPath(n) + ".tmp");
+    upOk = false;
+  }
+}
+
+void handleImgDone() { server.send(upOk ? 200 : 500, "text/plain", upOk ? "ok" : "failed"); }
+
+void handleOther() {                     // captive portal: send every other URL to the edit page
+  server.sendHeader("Location", "http://192.168.4.1/", true);
+  server.send(302, "text/plain", "");
+}
+
+void drawEditScreen() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextFont(1);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextSize(2);
+  tft.setTextColor(rgb(160, 235, 70), TFT_BLACK);
+  tft.drawString("EDIT MODE", 8, 4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Wi-Fi:", 8, 28);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString(AP_NAME, 92, 28);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Pass:", 8, 52);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString(AP_PASS, 92, 52);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("The edit page opens by itself.", 8, 88);
+  tft.drawString("If not, go to 192.168.4.1", 8, 101);
+  tft.drawString("Tap right button to cancel.", 8, 118);
+}
+
+void startEdit() {
+  editing = true;
+  exitPending = false;
+  editActivity = millis();
+  if (imgBuf) { free(imgBuf); imgBuf = nullptr; }      // Wi-Fi needs the memory; pictures are not shown while editing
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_NAME, AP_PASS);
+  delay(100);
+  dns.start(53, "*", WiFi.softAPIP());
+  server.begin();
+  drawEditScreen();
+  Serial.printf("edit mode: Wi-Fi %s at %s, free memory %u (largest block %u)\n", AP_NAME, WiFi.softAPIP().toString().c_str(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+}
+
+void stopEdit() {
+  server.stop();
+  dns.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  editing = false;
+  exitPending = false;
+  if (!imgBuf) imgBuf = (uint16_t*)malloc(IMG_BYTES);
+  cur = 0;
+  loadSlide();
+  Serial.println("edit mode off, Wi-Fi off");
+}
+
+// ---------------------------------------------------------------- power off
+void powerOff() {
+  Serial.println("going to sleep");
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextFont(1);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("bye!", 120, 67);
+  delay(800);
+  while (digitalRead(BTN_POWER) == LOW) delay(10);    // wait for the button to be let go
+  if (editing) stopEdit();
+  digitalWrite(TFT_BL, !TFT_BACKLIGHT_ON);
+  tft.writecommand(TFT_DISPOFF);
+  tft.writecommand(TFT_SLPIN);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_35, 0);        // right button wakes it
+  esp_deep_sleep_start();
+}
+
+// ---------------------------------------------------------------- buttons
+void handleButtons() {
+  static bool nextDown = false, nextHeld = false, powerDown = false;
+  static unsigned long nextAt = 0, powerAt = 0;
+  unsigned long now = millis();
+
+  bool n = digitalRead(BTN_NEXT) == LOW;
+  if (n && !nextDown) { nextDown = true; nextHeld = false; nextAt = now; }
+  else if (n && nextDown && !nextHeld && !editing && now - nextAt >= HOLD_MS) { nextHeld = true; startEdit(); }
+  else if (!n && nextDown) {
+    nextDown = false;
+    if (!nextHeld && now - nextAt > 30) {
+      if (editing) stopEdit();
+      else nextSlide();
+    }
+  }
+
+  bool p = digitalRead(BTN_POWER) == LOW;
+  if (p && !powerDown) { powerDown = true; powerAt = now; }
+  else if (p && powerDown && now - powerAt >= HOLD_MS) powerOff();
+  else if (!p) powerDown = false;
+}
+
+// ---------------------------------------------------------------- main
+void setup() {
+  Serial.begin(115200);
+  pinMode(BTN_NEXT, INPUT);
+  pinMode(BTN_POWER, INPUT_PULLUP);
+  pinMode(ADC_EN, OUTPUT);
+  digitalWrite(ADC_EN, HIGH);
+  WiFi.mode(WIFI_OFF);
+  btStop();
+
+  tft.init();
+  tft.setRotation(1);                 // landscape 240x135
+  spr.createSprite(W, H);
+  imgBuf = (uint16_t*)malloc(IMG_BYTES);
+  if (!LittleFS.begin(true)) Serial.println("picture storage failed to start");
+
+  loadSettings();
+  loadSlide();
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/img", HTTP_GET, handleImgGet);
+  server.on("/img", HTTP_POST, handleImgDone, handleImgUpload);
+  server.onNotFound(handleOther);
+  Serial.printf("ready: %d slide(s), speed %s, picture buffer %s\n", numSlides, SPEED_NAMES[speedIdx], imgBuf ? "ok" : "MISSING");
+}
+
+void loop() {
+  handleButtons();
+
+  if (editing) {
+    dns.processNextRequest();
+    server.handleClient();
+    if (exitPending && millis() - savedAt > 1500) stopEdit();
+    else if (!exitPending && millis() - editActivity > EDIT_TIMEOUT_MS) stopEdit();
+    delay(2);
+    return;
+  }
+
+  drawFrame();
+  delay(FRAME_MS);
+}

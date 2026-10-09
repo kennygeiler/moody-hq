@@ -1,0 +1,364 @@
+// Hair-clip scrolling display for the LilyGO / HiLetgo T-Display (ESP32, 1.14" 240x135).
+//
+// Normal mode: scrolls the saved messages one after another. Wi-Fi is off.
+//   Right button (GPIO35) tap        -> next message
+//   Right button hold 2 s            -> edit mode
+//   Left button (GPIO0) hold 2 s     -> turn off (deep sleep). Right button turns it back on.
+// Edit mode: the board makes its own Wi-Fi network "HAIR-DISPLAY". Join it from a phone and a
+// page opens to change the messages, color and speed. Saving, a right-button tap or 5 minutes
+// without activity turns Wi-Fi back off. Settings survive power-off (stored in flash).
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+
+TFT_eSPI tft;
+TFT_eSprite spr(&tft);
+WebServer server(80);
+DNSServer dns;
+Preferences prefs;
+
+const char* AP_NAME = "HAIR-DISPLAY";
+const int BTN_NEXT = 35;                 // right button
+const int BTN_POWER = 0;                 // left button
+const unsigned long HOLD_MS = 2000;
+const unsigned long EDIT_TIMEOUT_MS = 5UL * 60 * 1000;
+const int TEXT_SIZE = 5;                 // chunky pixel look (built-in 6x8 font x5)
+const int MAX_MSGS = 10;
+const int MAX_LEN = 80;
+
+struct Theme { const char* name; uint8_t bg[3]; uint8_t fg[3]; };
+const Theme THEMES[] = {
+  {"Green",  {160, 235, 70},  {0, 0, 0}},
+  {"Pink",   {255, 130, 200}, {0, 0, 0}},
+  {"Yellow", {255, 225, 40},  {0, 0, 0}},
+  {"Orange", {255, 140, 30},  {0, 0, 0}},
+  {"Blue",   {40, 90, 255},   {255, 255, 255}},
+  {"Night",  {0, 0, 0},       {255, 255, 255}},
+};
+const int NUM_THEMES = sizeof(THEMES) / sizeof(THEMES[0]);
+const int SPEED_MS[] = {24, 12, 5};      // delay per 2px step
+const char* SPEED_NAMES[] = {"Slow", "Medium", "Fast"};
+
+String msgs[MAX_MSGS];
+int numMsgs = 0;
+int theme = 0;
+int speedIdx = 1;
+uint16_t BG, FG;
+int msgIdx = 0;
+int x = 240;
+int textW = 0;
+
+bool editing = false;
+bool exitPending = false;
+unsigned long editActivity = 0;
+unsigned long savedAt = 0;
+
+// ---------------------------------------------------------------- battery
+// T-Display v1.1: GPIO14 switches on the battery divider, GPIO34 reads half the battery voltage.
+const int ADC_EN = 14;
+const int ADC_PIN = 34;
+
+float batteryVolts() {
+  uint32_t mv = 0;
+  for (int i = 0; i < 16; i++) mv += analogReadMilliVolts(ADC_PIN);
+  return mv / 16.0f * 2 / 1000.0f;
+}
+
+void logBattery() {                       // min/max spread shows whether a real battery is attached
+  static unsigned long last = 0;
+  if (millis() - last < 2000) return;
+  last = millis();
+  float lo = 99, hi = 0, sum = 0;
+  for (int i = 0; i < 40; i++) {
+    float v = analogReadMilliVolts(ADC_PIN) * 2 / 1000.0f;
+    lo = min(lo, v); hi = max(hi, v); sum += v;
+    delayMicroseconds(500);
+  }
+  Serial.printf("battery: avg %.2f V  min %.2f  max %.2f\n", sum / 40, lo, hi);
+}
+
+// ---------------------------------------------------------------- settings
+// The pixel font only has plain ASCII. Turn iPhone smart punctuation into ASCII and drop
+// anything else it can't draw (emoji, accents).
+String cleanText(const String& in) {
+  String out;
+  for (int i = 0; i < (int)in.length(); i++) {
+    uint8_t c = in[i];
+    if (c == '\n' || (c >= 32 && c < 127)) {
+      out += (char)c;
+    } else if (c == 0xE2 && i + 2 < (int)in.length() && (uint8_t)in[i + 1] == 0x80) {
+      uint8_t d = in[i + 2];
+      if (d == 0x98 || d == 0x99) out += '\'';
+      else if (d == 0x9C || d == 0x9D) out += '"';
+      else if (d == 0x93 || d == 0x94) out += '-';
+      else if (d == 0xA6) out += "...";
+      i += 2;
+    }
+  }
+  return out;
+}
+
+void parseMessages(const String& all) {
+  numMsgs = 0;
+  int start = 0;
+  while (start <= (int)all.length() && numMsgs < MAX_MSGS) {
+    int nl = all.indexOf('\n', start);
+    if (nl < 0) nl = all.length();
+    String line = all.substring(start, nl);
+    line.trim();
+    if (line.length()) msgs[numMsgs++] = line.substring(0, MAX_LEN);
+    start = nl + 1;
+  }
+  if (numMsgs == 0) msgs[numMsgs++] = "hi :)";
+}
+
+String joinedMessages() {
+  String all;
+  for (int i = 0; i < numMsgs; i++) {
+    if (i) all += '\n';
+    all += msgs[i];
+  }
+  return all;
+}
+
+void loadSettings() {
+  prefs.begin("hair", false);
+  String all = prefs.getString("msgs", "hi :)\nit works!");
+  theme = prefs.getInt("theme", 0);
+  speedIdx = prefs.getInt("speed", 1);
+  prefs.end();
+  if (theme < 0 || theme >= NUM_THEMES) theme = 0;
+  if (speedIdx < 0 || speedIdx > 2) speedIdx = 1;
+  parseMessages(all);
+}
+
+void saveSettings() {
+  prefs.begin("hair", false);
+  prefs.putString("msgs", joinedMessages());
+  prefs.putInt("theme", theme);
+  prefs.putInt("speed", speedIdx);
+  prefs.end();
+}
+
+// ---------------------------------------------------------------- scrolling
+void applyTheme() {
+  const Theme& t = THEMES[theme];
+  BG = tft.color565(t.bg[0], t.bg[1], t.bg[2]);
+  FG = tft.color565(t.fg[0], t.fg[1], t.fg[2]);
+  spr.setTextColor(FG, BG);
+}
+
+void loadMsg() {
+  spr.setTextSize(TEXT_SIZE);
+  textW = spr.textWidth(msgs[msgIdx]);
+  x = 240;
+}
+
+void nextMsg() {
+  msgIdx = (msgIdx + 1) % numMsgs;
+  loadMsg();
+}
+
+// ---------------------------------------------------------------- edit mode (Wi-Fi)
+String esc(const String& s) {
+  String o;
+  for (char c : s) {
+    if (c == '&') o += "&amp;";
+    else if (c == '<') o += "&lt;";
+    else if (c == '>') o += "&gt;";
+    else if (c == '"') o += "&quot;";
+    else o += c;
+  }
+  return o;
+}
+
+const char PAGE_HEAD[] PROGMEM = R"html(<!doctype html><html><head>
+<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Hair display</title><style>
+body{font-family:-apple-system,system-ui,sans-serif;margin:0;padding:20px;background:#111;color:#eee}
+h1{font-size:24px;margin:0 0 6px}p{color:#aaa;margin:0;font-size:15px;line-height:1.4}
+.h{font-weight:700;margin:22px 0 8px}
+textarea{width:100%;box-sizing:border-box;height:170px;font-size:18px;padding:12px;border-radius:12px;border:1px solid #444;background:#222;color:#fff}
+.opts{display:flex;flex-wrap:wrap;gap:8px}.opts input{display:none}
+.opts span{display:inline-block;padding:11px 15px;border-radius:12px;border:3px solid transparent;font-weight:700}
+.opts input:checked+span{border-color:#fff}.spd span{background:#333;color:#fff}
+button{margin-top:26px;width:100%;padding:17px;font-size:19px;font-weight:800;border:0;border-radius:14px;background:#a0eb46;color:#000}
+</style></head><body><h1>Hair display</h1>
+<p>One message per line, up to 10. Letters, numbers and punctuation only (no emoji).</p>
+<form method=post action=/save><div class=h>Messages</div>
+<textarea name=m maxlength=900 autocapitalize=off autocorrect=off spellcheck=false>)html";
+
+void handleRoot() {
+  editActivity = millis();
+  String page = FPSTR(PAGE_HEAD);
+  page += esc(joinedMessages());
+  page += "</textarea><div class=h>Color</div><div class=opts>";
+  for (int i = 0; i < NUM_THEMES; i++) {
+    const Theme& t = THEMES[i];
+    page += "<label><input type=radio name=t value=" + String(i) + (i == theme ? " checked" : "") +
+            "><span style=\"background:rgb(" + String(t.bg[0]) + "," + String(t.bg[1]) + "," + String(t.bg[2]) +
+            ");color:rgb(" + String(t.fg[0]) + "," + String(t.fg[1]) + "," + String(t.fg[2]) +
+            ");border-color:" + (i == theme ? "#fff" : "#555") + "\">" + t.name + "</span></label>";
+  }
+  page += "</div><div class=h>Speed</div><div class=\"opts spd\">";
+  for (int i = 0; i < 3; i++) {
+    page += "<label><input type=radio name=s value=" + String(i) + (i == speedIdx ? " checked" : "") +
+            "><span>" + SPEED_NAMES[i] + "</span></label>";
+  }
+  page += "</div><button>Save</button></form><p style=\"margin-top:18px\">Battery: " + String(batteryVolts(), 2) +
+          " V (full 4.2, low 3.4)</p></body></html>";
+  server.send(200, "text/html", page);
+}
+
+void handleSave() {
+  parseMessages(cleanText(server.arg("m")));
+  theme = constrain(server.arg("t").toInt(), 0, NUM_THEMES - 1);
+  speedIdx = constrain(server.arg("s").toInt(), 0, 2);
+  saveSettings();
+  Serial.printf("saved %d message(s), theme %s, speed %s\n", numMsgs, THEMES[theme].name, SPEED_NAMES[speedIdx]);
+  server.send(200, "text/html",
+              "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+              "<body style=\"font-family:-apple-system,sans-serif;background:#111;color:#eee;padding:24px\">"
+              "<h1>Saved!</h1><p>It's scrolling your new text. Wi-Fi is turning off, so you can close this.</p>");
+  savedAt = millis();
+  exitPending = true;
+}
+
+void handleOther() {                     // captive portal: send every other URL to the edit page
+  server.sendHeader("Location", "http://192.168.4.1/", true);
+  server.send(302, "text/plain", "");
+}
+
+void drawEditScreen() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextFont(1);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextSize(2);
+  tft.setTextColor(tft.color565(160, 235, 70), TFT_BLACK);
+  tft.drawString("EDIT MODE", 8, 6);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Join Wi-Fi:", 8, 34);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString(AP_NAME, 8, 56);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("The edit page opens by itself.", 8, 88);
+  tft.drawString("If not, go to 192.168.4.1", 8, 101);
+  tft.drawString("Tap right button to cancel.", 8, 118);
+}
+
+void startEdit() {
+  editing = true;
+  exitPending = false;
+  editActivity = millis();
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_NAME);
+  delay(100);
+  dns.start(53, "*", WiFi.softAPIP());
+  server.begin();
+  drawEditScreen();
+  Serial.printf("edit mode: Wi-Fi %s at %s\n", AP_NAME, WiFi.softAPIP().toString().c_str());
+}
+
+void stopEdit() {
+  server.stop();
+  dns.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  editing = false;
+  exitPending = false;
+  applyTheme();
+  msgIdx = 0;
+  loadMsg();
+  Serial.println("edit mode off, Wi-Fi off");
+}
+
+// ---------------------------------------------------------------- power off
+void powerOff() {
+  Serial.println("going to sleep");
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("bye!", 120, 67);
+  delay(800);
+  while (digitalRead(BTN_POWER) == LOW) delay(10);    // wait for the button to be let go
+  if (editing) stopEdit();
+  digitalWrite(TFT_BL, !TFT_BACKLIGHT_ON);
+  tft.writecommand(TFT_DISPOFF);
+  tft.writecommand(TFT_SLPIN);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_35, 0);        // right button wakes it
+  esp_deep_sleep_start();
+}
+
+// ---------------------------------------------------------------- buttons
+void handleButtons() {
+  static bool nextDown = false, nextHeld = false, powerDown = false;
+  static unsigned long nextAt = 0, powerAt = 0;
+  unsigned long now = millis();
+
+  bool n = digitalRead(BTN_NEXT) == LOW;
+  if (n && !nextDown) { nextDown = true; nextHeld = false; nextAt = now; }
+  else if (n && nextDown && !nextHeld && !editing && now - nextAt >= HOLD_MS) { nextHeld = true; startEdit(); }
+  else if (!n && nextDown) {
+    nextDown = false;
+    if (!nextHeld && now - nextAt > 30) {
+      if (editing) stopEdit();
+      else nextMsg();
+    }
+  }
+
+  bool p = digitalRead(BTN_POWER) == LOW;
+  if (p && !powerDown) { powerDown = true; powerAt = now; }
+  else if (p && powerDown && now - powerAt >= HOLD_MS) powerOff();
+  else if (!p) powerDown = false;
+}
+
+// ---------------------------------------------------------------- main
+void setup() {
+  Serial.begin(115200);
+  pinMode(BTN_NEXT, INPUT);
+  pinMode(BTN_POWER, INPUT_PULLUP);
+  pinMode(ADC_EN, OUTPUT);
+  digitalWrite(ADC_EN, HIGH);
+  WiFi.mode(WIFI_OFF);
+  btStop();
+
+  tft.init();
+  tft.setRotation(1);                 // landscape 240x135
+  spr.createSprite(240, 135);
+  spr.setTextFont(1);
+  spr.setTextDatum(ML_DATUM);
+
+  loadSettings();
+  applyTheme();
+  loadMsg();
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.onNotFound(handleOther);
+  Serial.printf("ready: %d message(s), theme %s, speed %s\n", numMsgs, THEMES[theme].name, SPEED_NAMES[speedIdx]);
+}
+
+void loop() {
+  handleButtons();
+  logBattery();
+
+  if (editing) {
+    dns.processNextRequest();
+    server.handleClient();
+    if (exitPending && millis() - savedAt > 1500) stopEdit();
+    else if (!exitPending && millis() - editActivity > EDIT_TIMEOUT_MS) stopEdit();
+    delay(2);
+    return;
+  }
+
+  spr.fillSprite(BG);
+  spr.drawString(msgs[msgIdx], x, 67);
+  spr.pushSprite(0, 0);
+  x -= 2;
+  if (x < -textW) nextMsg();
+  delay(SPEED_MS[speedIdx]);
+}
